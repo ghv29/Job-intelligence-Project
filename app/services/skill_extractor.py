@@ -26,6 +26,13 @@ def extract_skills(description: str) -> list[dict]:
     technical_rules = {
         "Python": ("python",),
         "SQL": ("sql",),
+        # Enterprise / analytics stack signals
+        # Note: these keywords are intentionally explicit (not too broad) so we
+        # don't create many false positives from short substrings.
+        "SAP": ("sap",),
+        "dbt": ("dbt",),
+        "Azure": ("azure",),
+        "AWS": ("aws", "amazon web services",),
         "Power BI": ("power bi", "powerbi"),
         "Tableau": ("tableau",),
         "Excel": ("excel",),

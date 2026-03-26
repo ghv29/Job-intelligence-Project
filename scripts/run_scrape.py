@@ -1,4 +1,25 @@
+"""
+Scrape jobs and upsert them into the database.
+
+Important Windows note:
+If you run this file as `python scripts/run_scrape.py`, Python sets the import root
+to the `scripts/` folder, so `import app...` may fail.
+
+This small bootstrap makes both of these work:
+  - python scripts/run_scrape.py
+  - python -m scripts.run_scrape   (recommended)
+"""
+
+from __future__ import annotations
+
+import sys
 from datetime import date
+from pathlib import Path
+
+# Ensure repository root is on sys.path when running as a file.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from app.db.models import Job, Skill
 from app.db.session import Base, SessionLocal, engine
