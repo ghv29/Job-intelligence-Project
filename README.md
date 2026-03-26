@@ -70,7 +70,7 @@ streamlit run dashboard/streamlit_app.py
 ### 6) Run scraping script (placeholder)
 
 ```bash
-python scripts/run_scrape.py
+python -m scripts.run_scrape
 ```
 
 ## GitHub automation included
