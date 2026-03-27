@@ -187,7 +187,7 @@ The hybrid match score combines **seven weighted components** (all editable from
 | CI | GitHub Actions |
 
 ---
-
+**Goldie V* — [LinkedIn](https://www.linkedin.com/in/goldiev)
 <p align="center">
   Built with ☕ and 🐍 for the German job market.
 </p>
