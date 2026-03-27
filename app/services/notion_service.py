@@ -8,6 +8,18 @@ from notion_client import Client
 from notion_client.errors import APIResponseError
 
 
+def _get_streamlit_secret(key: str) -> str:
+    """
+    Return a secret from Streamlit (`st.secrets`) when available, else "".
+    """
+    try:
+        import streamlit as st  # type: ignore
+
+        return str(st.secrets.get(key, "")) or ""
+    except Exception:
+        return ""
+
+
 def create_job_tracking_page(job: dict, match_score: float, notes: str = "") -> str:
     """
     Create a job tracking page in Notion.
@@ -15,13 +27,20 @@ def create_job_tracking_page(job: dict, match_score: float, notes: str = "") -> 
     For the class demo, Notion is optional. If credentials are missing,
     we simulate a page id so the rest of the app still works.
     """
-    if not settings.notion_api_key or not settings.notion_database_id:
+    notion_token = (
+        _get_streamlit_secret("NOTION_API_KEY")
+        or _get_streamlit_secret("NOTION_TOKEN")
+        or settings.notion_api_key
+    )
+    notion_db_id = _get_streamlit_secret("NOTION_DATABASE_ID") or settings.notion_database_id
+
+    if not notion_token or not notion_db_id:
         _ = (job, match_score, notes)
         return f"simulated-{uuid.uuid4()}"
 
     logger = logging.getLogger("notion")
 
-    client = Client(auth=settings.notion_api_key)
+    client = Client(auth=notion_token)
 
     # Property names in your Notion database (as created by you):
     # The Title property label differs across Notion templates, so we try a few.
@@ -55,7 +74,7 @@ def create_job_tracking_page(job: dict, match_score: float, notes: str = "") -> 
 
         try:
             page = client.pages.create(
-                parent={"database_id": settings.notion_database_id},
+                parent={"database_id": notion_db_id},
                 properties=properties,
             )
             return page["id"]

@@ -59,6 +59,13 @@ def _normalize_notion_database_id(value: str) -> str:
     return v
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _clean_env(os.getenv(name, ""))
+    if not raw:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class Settings:
     # Core app settings
@@ -75,6 +82,7 @@ class Settings:
     telegram_bot_token: str = _clean_env(os.getenv("TELEGRAM_BOT_TOKEN", ""))
     notion_api_key: str = _clean_env(os.getenv("NOTION_API_KEY", ""))
     notion_database_id: str = _normalize_notion_database_id(os.getenv("NOTION_DATABASE_ID", ""))
+    use_mock_indeed: bool = _env_bool("USE_MOCK_INDEED", default=False)
 
 
 # Shared settings object imported across the app.
