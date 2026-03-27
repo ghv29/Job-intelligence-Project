@@ -25,6 +25,10 @@ def run_bot() -> None:
     # re-delivers an update or if polling restarts quickly).
     processed_update_ids: set[int] = set()
 
+    # Per-chat short conversation history for better continuity.
+    # Key: chat_id, Value: list of {"role": "...", "content": "..."} dicts.
+    conversation_history: dict[int, list[dict[str, str]]] = {}
+
     async def _reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
         """
         Single place that calls the agent and sends back the reply.
@@ -36,9 +40,17 @@ def run_bot() -> None:
         if len(processed_update_ids) > 5000:
             processed_update_ids.clear()
 
-        result = handle_user_query(user_text)
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        history = conversation_history.get(chat_id, [])
+
+        result = handle_user_query(user_text, conversation_history=history)
         reply_text = result.get("reply") or "Done."
         await update.message.reply_text(reply_text)
+
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": reply_text})
+        history = history[-10:]
+        conversation_history[chat_id] = history
 
     async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         k = context.args[0] if context.args else ""

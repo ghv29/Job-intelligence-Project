@@ -9,11 +9,12 @@ from openai import AuthenticationError, OpenAIError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
-from app.db.models import Job, SavedJob
+from app.db.models import AgentMemory, Job, SavedJob
 from app.db.session import SessionLocal
-from app.profile import build_profile
-from app.services.matcher import load_active_jobs_with_skills, score_job_for_profile
+from app.profile import get_effective_profile
+from app.services.matcher import load_active_jobs_with_skills, score_job_for_profile, semantic_scores_for_jobs
 from app.services.notion_service import create_job_tracking_page
+from app.services.pinecone_store import retrieve_memories, save_memory
 
 
 def _extract_first_int(text: str) -> int | None:
@@ -52,6 +53,47 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         return None
 
 
+def build_system_prompt(profile: dict[str, Any], memories: list[str] | None = None) -> str:
+    """
+    Build the system prompt for intent parsing, optionally injecting remembered preferences.
+
+    Returns a system prompt string used to convert free text into a single JSON action.
+    """
+    memories = memories or []
+    memories_section = ""
+    if memories:
+        bullets = "\n".join([f"- {m}" for m in memories])
+        memories_section = "\n\n## Your remembered preferences\n" + bullets + "\n"
+
+    return (
+        "You are an assistant that helps with German job intelligence.\n"
+        "Convert the user's message into a single JSON object.\n"
+        "You must follow the schema exactly.\n"
+        + memories_section
+        + "\nSchema:\n"
+        "{\n"
+        '  "action": one of ["top_matches","save_job","help","explain_profile_match","save_memory"],\n'
+        '  "top_k": integer (only for top_matches, default 5),\n'
+        '  "city": string or null (optional filter),\n'
+        '  "job_id": integer or null (only for save_job),\n'
+        '  "notes": string (optional notes),\n'
+        '  "content": string or null (only for save_memory),\n'
+        '  "memory_type": string or null (only for save_memory; use "preference"),\n'
+        '  "language": "en" (always)\n'
+        "}\n"
+        "Rules:\n"
+        "- If the user greets (hello/hi/hallo), use action=help.\n"
+        "- If the message asks for top matches, use action=top_matches.\n"
+        "- If the message asks to save a job, use action=save_job and extract job_id.\n"
+        "- If job_id is not present for save_job, set job_id=null.\n"
+        "- If the user states a preference, shares feedback on a job, or says anything starting with "
+        '"remember that", use action=save_memory.\n'
+        "- For save_memory, set memory_type=preference and put the memory text in content.\n"
+        "- If unsure, default to top_matches.\n"
+        "- Output JSON only, no markdown.\n"
+    )
+
+
 def _deterministic_action(user_message: str) -> dict[str, Any]:
     """
     Fallback action parsing without an LLM.
@@ -79,12 +121,18 @@ def _deterministic_action(user_message: str) -> dict[str, Any]:
         job_id = _extract_first_int(msg)
         return {"action": "save_job", "job_id": job_id}
 
+    if msg.startswith("remember that"):
+        content = user_message.strip()[len("remember that") :].strip()
+        return {"action": "save_memory", "content": content or user_message.strip(), "memory_type": "preference"}
+
     # Default: interpret as "show top matches"
     top_k = _extract_first_int(msg) or 5
     return {"action": "top_matches", "top_k": top_k}
 
 
-def _llm_action(user_message: str, profile: dict[str, Any]) -> dict[str, Any] | None:
+def _llm_action(
+    user_message: str, profile: dict[str, Any], memories: list[str] | None = None
+) -> dict[str, Any] | None:
     """
     Ask the LLM to convert the user's message into a structured action.
 
@@ -96,27 +144,7 @@ def _llm_action(user_message: str, profile: dict[str, Any]) -> dict[str, Any] | 
 
     client = OpenAI(api_key=settings.openai_api_key)
 
-    system_prompt = (
-        "You are an assistant that helps with German job intelligence.\n"
-        "Convert the user's message into a single JSON object.\n"
-        "You must follow the schema exactly.\n"
-        "Schema:\n"
-        "{\n"
-        '  "action": one of ["top_matches","save_job","help","explain_profile_match"],\n'
-        '  "top_k": integer (only for top_matches, default 5),\n'
-        '  "city": string or null (optional filter),\n'
-        '  "job_id": integer or null (only for save_job),\n'
-        '  "notes": string (optional notes),\n'
-        "  \"language\": \"en\" (always)\n"
-        "}\n"
-        "Rules:\n"
-        "- If the user greets (hello/hi/hallo), use action=help.\n"
-        "- If the message asks for top matches, use action=top_matches.\n"
-        "- If the message asks to save a job, use action=save_job and extract job_id.\n"
-        "- If job_id is not present for save_job, set job_id=null.\n"
-        "- If unsure, default to top_matches.\n"
-        "- Output JSON only, no markdown.\n"
-    )
+    system_prompt = build_system_prompt(profile=profile, memories=memories or [])
 
     user_prompt = (
         f"User message: {user_message}\n\n"
@@ -207,7 +235,9 @@ def _save_job(session, job: dict[str, Any], match_score: float, notes: str = "")
     return saved.id
 
 
-def handle_user_query(user_message: str) -> dict[str, Any]:
+def handle_user_query(
+    user_message: str, conversation_history: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
     """
     Main entrypoint used by Streamlit and (later) Telegram.
 
@@ -217,13 +247,19 @@ def handle_user_query(user_message: str) -> dict[str, Any]:
       - saved_job_id: int (only for save_job)
     """
     user_message = user_message or ""
-    profile = build_profile()
+    memories: list[str] = []
+    try:
+        memories = retrieve_memories(user_message, top_k=5)
+    except Exception:
+        memories = []
 
     # Make greeting behavior consistent even if LLM is enabled.
     if _is_greeting(user_message):
         action = {"action": "help"}
     else:
-        action = _llm_action(user_message, profile=profile) or _deterministic_action(user_message)
+        action = _llm_action(user_message, profile=profile, memories=memories) or _deterministic_action(
+            user_message
+        )
     action_type = action.get("action")
 
     if not SessionLocal:
@@ -231,6 +267,7 @@ def handle_user_query(user_message: str) -> dict[str, Any]:
 
     try:
         with SessionLocal() as session:
+            profile = get_effective_profile(session=session)
             if action_type == "help":
                 return {
                     "reply": (
@@ -267,12 +304,36 @@ def handle_user_query(user_message: str) -> dict[str, Any]:
                     "actions": [],
                 }
 
+            if action_type == "save_memory":
+                content = (action.get("content") or "").strip()
+                memory_type = (action.get("memory_type") or "preference").strip() or "preference"
+                if not content:
+                    content = user_message.strip()
+
+                pinecone_id = ""
+                try:
+                    pinecone_id = save_memory(content=content, memory_type=memory_type)
+                except Exception as e:
+                    return {"reply": f"I couldn't save that memory right now (Pinecone error: {e}).", "actions": []}
+
+                session.add(
+                    AgentMemory(
+                        memory_type=memory_type,
+                        content=content,
+                        pinecone_id=pinecone_id,
+                    )
+                )
+                session.commit()
+                return {"reply": "Got it — I’ll remember that preference.", "actions": []}
+
             # Default: top matches
             if action_type in {"top_matches", None}:
                 top_k = int(action.get("top_k") or 5)
                 scored_jobs = []
                 jobs = load_active_jobs_with_skills(session=session, limit=max(50, top_k * 5))
+                semantic_map = semantic_scores_for_jobs([int(j["id"]) for j in jobs], profile=profile)
                 for j in jobs:
+                    j["semantic_score"] = semantic_map.get(int(j["id"]), 0.0)
                     scoring = score_job_for_profile(j, profile=profile)
                     scored_jobs.append({**j, **scoring})
 

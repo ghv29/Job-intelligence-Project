@@ -143,6 +143,7 @@ def _one_card_to_job(card: BeautifulSoup) -> dict | None:
         "location": location,
         "description": description or title,
         "url": url,
+        "source": "stepstone",
     }
     if posted:
         out["date_posted"] = posted.isoformat()
@@ -159,12 +160,46 @@ def _next_page_url(soup: BeautifulSoup, current_url: str) -> str | None:
     return _absolute_url(href)
 
 
+def _fetch_full_description(
+    session: Session,
+    job_url: str,
+    teaser_text: str,
+    *,
+    timeout_sec: int = 40,
+) -> str:
+    """
+    Fetch full job-page text when teaser is too short.
+    Falls back to teaser when detail page parsing fails.
+    """
+    if len((teaser_text or "").strip()) >= 160:
+        return teaser_text
+    try:
+        resp = session.get(job_url, timeout=timeout_sec)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        candidates = [
+            soup.select_one('[data-at="job-ad-content"]'),
+            soup.select_one("article"),
+            soup.find("main"),
+        ]
+        for node in candidates:
+            if not node:
+                continue
+            text = " ".join(node.get_text(separator=" ", strip=True).split())
+            if len(text) >= 220:
+                return text
+    except Exception:
+        return teaser_text
+    return teaser_text
+
+
 def fetch_stepstone_jobs(
     query: str,
     location: str,
     *,
     max_pages: int = 1,
     page_delay_sec: float = 1.0,
+    fetch_full_description: bool = True,
     session: Session | None = None,
 ) -> list[dict]:
     """
@@ -207,6 +242,12 @@ def fetch_stepstone_jobs(
                 if u in seen_urls:
                     continue
                 seen_urls.add(u)
+                if fetch_full_description:
+                    job["description"] = _fetch_full_description(
+                        sess,
+                        job_url=u,
+                        teaser_text=job.get("description", ""),
+                    )
                 jobs.append(job)
 
             pages_read += 1

@@ -54,3 +54,11 @@ class AgentMemory(Base):
     content = Column(Text)
     pinecone_id = Column(String(100))
     created_at = Column(DateTime, server_default=func.now())
+
+
+class UserProfileSettings(Base):
+    __tablename__ = "user_profile_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    profile_json = Column(Text, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

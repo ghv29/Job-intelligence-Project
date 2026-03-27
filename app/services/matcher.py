@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Job, Skill
 from app.profile import build_profile
+from app.services.pinecone_store import search_jobs_semantic
 
 
 def _normalize_text(text: str | None) -> str:
@@ -35,6 +36,17 @@ def _to_iso_date(value: Any) -> str | None:
         return value.isoformat()
     if isinstance(value, str):
         return value
+    return None
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).date()
+        except ValueError:
+            return None
     return None
 
 
@@ -78,6 +90,46 @@ def load_active_jobs_with_skills(session: Session, limit: int = 50) -> list[dict
                 "skills": sorted(set(skills_by_job_id.get(j.id, []))),
             }
         )
+    return out
+
+
+def build_profile_query(profile: dict) -> str:
+    role_text = ", ".join(profile.get("target_roles", [])[:5])
+    skill_text = ", ".join(profile.get("skills_you_have", [])[:8])
+    watch_text = ", ".join(profile.get("skills_to_watch_for", [])[:6])
+    city_text = ", ".join(profile.get("priority_cities", [])[:5])
+    return (
+        f"Relevant jobs for roles: {role_text}. "
+        f"Skills: {skill_text}. "
+        f"Bonus skills: {watch_text}. "
+        f"Cities: {city_text}."
+    )
+
+
+def semantic_scores_for_jobs(job_ids: list[int], profile: dict) -> dict[int, float]:
+    if not job_ids:
+        return {}
+    try:
+        query = build_profile_query(profile)
+        hits = search_jobs_semantic(query, top_k=min(50, max(20, len(job_ids))))
+    except Exception:
+        return {}
+    max_score = max((float(h.get("score") or 0.0) for h in hits), default=0.0)
+    if max_score <= 0:
+        return {}
+    out: dict[int, float] = {}
+    wanted = set(int(i) for i in job_ids)
+    for hit in hits:
+        job_id = hit.get("job_id")
+        if job_id is None:
+            continue
+        jid = int(job_id)
+        if jid not in wanted:
+            continue
+        normalized = max(0.0, min(1.0, float(hit.get("score") or 0.0) / max_score))
+        existing = out.get(jid, 0.0)
+        if normalized > existing:
+            out[jid] = normalized
     return out
 
 
@@ -166,6 +218,14 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
       - skill_gaps: watchlist skills missing from the job
     """
     profile = profile or build_profile()
+    weights = profile.get("weights", {})
+    w_role = float(weights.get("role", 0.35))
+    w_location = float(weights.get("location", 0.25))
+    w_skills = float(weights.get("skills", 0.40))
+    w_watch = float(weights.get("watch_bonus", 0.15))
+    w_edge = float(weights.get("sector_edge", 0.15))
+    w_semantic = float(weights.get("semantic", 0.20))
+    w_freshness = float(weights.get("freshness", 0.10))
     job_title = job.get("title", "")
     job_desc = job.get("description", "")
     job_location = job.get("location", "")
@@ -190,7 +250,7 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
     role_score = 0.0
     if role_hits:
         # More role hits => higher score, capped.
-        role_score = min(0.35, 0.12 * len(role_hits))
+        role_score = min(w_role, 0.12 * len(role_hits))
         reasons.append(f"Role keywords matched: {', '.join(role_hits[:2])}")
 
     # 2) Location match (explicit city priority)
@@ -198,13 +258,13 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
     top_city = None
     for c in priority_cities:
         if c and c in normalized_location:
-            location_score = 0.25
+            location_score = w_location
             top_city = c
             break
     if location_score <= 0.0:
         for c in secondary_cities:
             if c and c in normalized_location:
-                location_score = 0.12
+                location_score = min(w_location, 0.12)
                 top_city = c
                 break
     if top_city:
@@ -216,7 +276,7 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
 
     overlap = skills_you_have.intersection(job_skills)
     overlap_ratio = (len(overlap) / max(1, len(skills_you_have)))
-    skill_score = min(0.4, 0.4 * overlap_ratio)
+    skill_score = min(w_skills, w_skills * overlap_ratio)
     if overlap:
         # Keep it short and readable for a demo.
         reasons.append(f"Skills overlap: {', '.join(sorted(overlap)[:3])}")
@@ -224,7 +284,7 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
     watch_present = skills_to_watch_for.intersection(job_skills)
     watch_bonus = 0.0
     if watch_present:
-        watch_bonus = min(0.15, 0.03 * len(watch_present))
+        watch_bonus = min(w_watch, 0.03 * len(watch_present))
         reasons.append(f"Nice-to-have present: {', '.join(sorted(watch_present)[:3])}")
 
     # 4) Engineering/sector edge weighting
@@ -234,12 +294,26 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
     for kw in profile["sector_edge_keywords"]:
         if _normalize_text(kw) and _normalize_text(kw) in combined_text:
             edge_hits += 1
-    edge_score = min(0.15, 0.02 * edge_hits)
+    edge_score = min(w_edge, 0.02 * edge_hits)
     if edge_hits:
         reasons.append("Engineering/industry signals found")
 
+    posted_date = _parse_iso_date(job.get("date_posted"))
+    freshness_score = 0.0
+    if posted_date:
+        age_days = max(0, (date.today() - posted_date).days)
+        if age_days <= 3:
+            freshness_score = w_freshness
+        elif age_days <= 7:
+            freshness_score = w_freshness * 0.65
+        elif age_days <= 14:
+            freshness_score = w_freshness * 0.35
+
+    semantic_raw = float(job.get("semantic_score") or 0.0)
+    semantic_score = max(0.0, min(w_semantic, semantic_raw * w_semantic))
+
     # Combine into final score
-    match_score = role_score + location_score + skill_score + watch_bonus + edge_score
+    match_score = role_score + location_score + skill_score + watch_bonus + edge_score + freshness_score + semantic_score
     match_score = max(0.0, min(1.0, match_score))
 
     # 5) Skill gaps (from skills_to_watch_for)
@@ -256,6 +330,15 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
         "skill_gaps": skill_gaps,
         # These fields are helpful for debugging/UI; they’re not required.
         "debug": {
+            "score_components": {
+                "role": round(role_score, 3),
+                "location": round(location_score, 3),
+                "skills": round(skill_score, 3),
+                "watch_bonus": round(watch_bonus, 3),
+                "sector_edge": round(edge_score, 3),
+                "freshness": round(freshness_score, 3),
+                "semantic": round(semantic_score, 3),
+            },
             "role_hits": role_hits,
             "overlap_skills": sorted(overlap),
             "watch_present": sorted(watch_present),
