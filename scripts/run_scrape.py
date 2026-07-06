@@ -241,6 +241,15 @@ def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CIT
     jobs_per_source: dict[str, int] = {}
     description_lengths: list[int] = []
 
+    # Embeddings are optional: the keyword/skill scoring and the career-ops
+    # export work without them. Skip cleanly when keys are missing, and stop
+    # retrying after a quota/auth error instead of burning a call per job.
+    embeddings_enabled = bool(settings.openai_api_key and settings.pinecone_api_key and settings.pinecone_index)
+    if not embeddings_enabled:
+        print("Embeddings disabled (OPENAI_API_KEY / PINECONE_API_KEY not set) — skipping Pinecone sync.")
+
+    _FATAL_EMBEDDING_MARKERS = ("insufficient_quota", "invalid_api_key", "authentication", "401")
+
     with SessionLocal() as session:
         # Process each job, upsert it, and track run metrics.
         for job in jobs:
@@ -270,21 +279,27 @@ def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CIT
                     description_txt = job_row.description or ""
 
                 # Pinecone vector upsert (best-effort; never abort the run).
-                try:
-                    vector_id = upsert_job_to_pinecone(
-                        job_id=job_id,
-                        title=title_txt,
-                        company=company_txt,
-                        location=location_txt,
-                        description=description_txt,
-                    )
-                    session.query(Job).filter(Job.id == job_id).update(
-                        {"pinecone_id": vector_id},
-                        synchronize_session=False,
-                    )
-                    pinecone_upserted += 1
-                except Exception as e:
-                    print(f"Pinecone upsert failed for job_id={job_id}: {e}")
+                if embeddings_enabled:
+                    try:
+                        vector_id = upsert_job_to_pinecone(
+                            job_id=job_id,
+                            title=title_txt,
+                            company=company_txt,
+                            location=location_txt,
+                            description=description_txt,
+                        )
+                        session.query(Job).filter(Job.id == job_id).update(
+                            {"pinecone_id": vector_id},
+                            synchronize_session=False,
+                        )
+                        pinecone_upserted += 1
+                    except Exception as e:
+                        message = str(e).lower()
+                        if any(marker in message for marker in _FATAL_EMBEDDING_MARKERS):
+                            embeddings_enabled = False
+                            print(f"Embedding API unavailable ({e.__class__.__name__}) — skipping Pinecone sync for the rest of this run.")
+                        else:
+                            print(f"Pinecone upsert failed for job_id={job_id}: {e}")
             except Exception as e:
                 print(f"Failed to process job url={job.get('url')} source={_source_name(job)} error={e}")
                 failed += 1
