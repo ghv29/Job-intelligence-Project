@@ -46,3 +46,4 @@ learning_notebooks/
 
 # Generated JD exports (scraped content, not for the public repo)
 scripts/exported_jds.md
+scripts/nightly.log

@@ -33,6 +33,7 @@ from app.services.matcher import score_job_for_profile
 
 CAREER_OPS_ROOT = Path(r"D:\Ironhack\Github\career-ops")
 PIPELINE_FILE = CAREER_OPS_ROOT / "data" / "pipeline.md"
+JDS_DIR = CAREER_OPS_ROOT / "jds"
 
 DEFAULT_MIN_SCORE = 0.45
 DEFAULT_LIMIT = 15
@@ -63,8 +64,49 @@ def _migrate_spanish_headers(content: str) -> str:
 
 
 def _extract_known_urls(content: str) -> set[str]:
-    """Pull every URL already present in the file (pending or processed)."""
-    return set(re.findall(r"https?://\S+", content))
+    """
+    Pull every URL already known to career-ops.
+
+    Since jobs are exported as local JD files (the pipeline line carries a
+    local: path, not the posting URL), the JD files themselves must also be
+    scanned — otherwise re-runs would duplicate previously exported jobs.
+    """
+    urls = set(re.findall(r"https?://\S+", content))
+    if JDS_DIR.exists():
+        for jd_file in JDS_DIR.glob("*.md"):
+            try:
+                urls.update(re.findall(r"https?://\S+", jd_file.read_text(encoding="utf-8")))
+            except OSError:
+                continue
+    return urls
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug[:max_len].rstrip("-") or "unknown"
+
+
+def _write_jd_file(job: Job) -> Path:
+    """
+    Save the already-scraped description as jds/{company}-{role}-{id}.md so
+    the career-ops pipeline reads it via the local: prefix instead of
+    re-extracting the posting with Playwright (30-60s + tokens per job).
+    """
+    JDS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{_slugify(job.company)}-{_slugify(job.title)}-{job.id}.md"
+    path = JDS_DIR / filename
+    body = (
+        f"# {(job.title or 'Unknown role').strip()}\n\n"
+        f"**Company:** {(job.company or 'Unknown').strip()}\n"
+        f"**Location:** {(job.location or 'N/A').strip()}\n"
+        f"**Posted:** {job.date_posted or 'N/A'}\n"
+        f"**Source URL:** {job.url}\n"
+        f"**Exported from StellenRadar:** {datetime.now(timezone.utc).date().isoformat()}\n\n"
+        f"---\n\n"
+        f"{job.description or '_No description stored — extract from the source URL._'}\n"
+    )
+    path.write_text(body, encoding="utf-8")
+    return path
 
 
 def _language_marker(scored: dict) -> str:
@@ -107,7 +149,13 @@ def _append_jobs(content: str, entries: list[tuple[Job, dict]]) -> tuple[str, in
     for job, scored in entries:
         company = (job.company or "Unknown company").strip()
         title = (job.title or "Unknown role").strip() + _language_marker(scored)
-        new_lines.append(f"- [ ] {job.url} | {company} | {title}\n")
+        if job.description and job.description.strip():
+            jd_path = _write_jd_file(job)
+            ref = f"local:jds/{jd_path.name}"
+        else:
+            # No stored description — let the career-ops agent extract from the URL.
+            ref = job.url
+        new_lines.append(f"- [ ] {ref} | {company} | {title}\n")
 
     lines[insert_at:insert_at] = new_lines
     return "".join(lines), len(new_lines)

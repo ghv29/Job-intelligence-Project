@@ -1,4 +1,4 @@
-name: Daily Scrape (placeholder)
+name: Daily Scrape
 
 on:
   workflow_dispatch:
@@ -8,6 +8,9 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # StepStone's WAF may throttle or block datacenter IPs; a failed run
+    # only means no new jobs today, so don't mark the repo red for it.
+    continue-on-error: true
 
     steps:
       - name: Checkout
@@ -17,13 +20,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Placeholder step
-        run: |
-          echo "Daily scrape workflow is configured."
-          echo "Enable DB + scraper execution after production credentials are set."
+      - name: Run scrape pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX: ${{ secrets.PINECONE_INDEX }}
+        run: python -m scripts.run_scrape --max-roles 3 --max-cities 3 --max-pages 2
