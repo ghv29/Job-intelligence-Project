@@ -38,7 +38,13 @@ except ImportError as e:
 from app.config import settings
 from app.db.models import Job, SavedJob, Skill
 from app.db.session import SessionLocal as _SessionLocal
-from app.profile import get_effective_profile, save_profile_to_db
+from app.profile import (
+    get_effective_profile,
+    load_profile_mode_from_db,
+    reset_profile_to_default_in_db,
+    save_profile_mode_to_db,
+    save_profile_to_db,
+)
 from app.services.matcher import (
     load_active_jobs_with_skills,
     score_job_for_profile,
@@ -218,11 +224,26 @@ with ctrl_right:
 if run_scraper:
     with st.sidebar.status("Running scraper...", expanded=True) as status:
         try:
+            # Scraper runtime is highly variable; allow tuning to prevent Streamlit timeouts.
+            scrape_timeout_sec = int(st.session_state.get("scrape_timeout_sec", 600))
+            max_roles = int(st.session_state.get("scrape_max_roles", 3))
+            max_cities = int(st.session_state.get("scrape_max_cities", 3))
+            max_pages = int(st.session_state.get("scrape_max_pages", 2))
             result = subprocess.run(
-                [sys.executable, str(REPO_ROOT / "scripts" / "run_scrape.py")],
+                [
+                    sys.executable,
+                    "-m",
+                    "scripts.run_scrape",
+                    "--max-roles",
+                    str(max_roles),
+                    "--max-cities",
+                    str(max_cities),
+                    "--max-pages",
+                    str(max_pages),
+                ],
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=scrape_timeout_sec,
                 cwd=str(REPO_ROOT),
             )
             if result.returncode == 0:
@@ -237,7 +258,7 @@ if run_scraper:
                 )
                 status.update(label="Scraper failed", state="error")
         except subprocess.TimeoutExpired:
-            st.sidebar.error("Scraper timed out (180 s).")
+            st.sidebar.error(f"Scraper timed out ({scrape_timeout_sec} s).")
             status.update(label="Timed out", state="error")
         except Exception as e:
             st.sidebar.error(f"Could not start scraper: {e}")
@@ -253,8 +274,94 @@ if SessionLocal:
     st.sidebar.subheader("Profile settings")
     with SessionLocal() as session:
         current_profile = get_effective_profile(session=session)
+        current_mode = load_profile_mode_from_db(session=session)
+
+    # --- Scraper tuning controls (sidebar) ---
+    with st.sidebar.expander("Scraper settings", expanded=False):
+        st.slider(
+            "Scraper timeout (seconds)",
+            min_value=180,
+            max_value=2400,
+            value=600,
+            step=60,
+            key="scrape_timeout_sec",
+            help="Increase if StepStone is slow or you have many queries.",
+        )
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.number_input(
+                "Max roles",
+                min_value=1,
+                max_value=10,
+                value=3,
+                step=1,
+                key="scrape_max_roles",
+                help="Only the first N target roles are used to scrape.",
+            )
+        with col_s2:
+            st.number_input(
+                "Max cities",
+                min_value=1,
+                max_value=10,
+                value=3,
+                step=1,
+                key="scrape_max_cities",
+                help="Only the first N priority cities are used to scrape.",
+            )
+        with col_s3:
+            st.number_input(
+                "Max pages",
+                min_value=1,
+                max_value=10,
+                value=2,
+                step=1,
+                key="scrape_max_pages",
+                help="How many StepStone result pages to read per query.",
+            )
 
     with st.sidebar.expander("Edit matching profile", expanded=False):
+        profile_mode = st.radio(
+            "Profile source",
+            options=["Default (use code defaults)", "Custom (use saved profile)"],
+            index=0 if current_mode == "default" else 1,
+            help=(
+                "Default: always use the profile from app/profile.py.\n"
+                "Custom: use the saved profile from the database."
+            ),
+            key="profile_mode_selector",
+        )
+        selected_mode = "default" if profile_mode.startswith("Default") else "custom"
+        if selected_mode != current_mode:
+            with SessionLocal() as session:
+                save_profile_mode_to_db(session=session, mode=selected_mode)
+                session.commit()
+            st.cache_data.clear()
+            st.rerun()
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            if st.button(
+                "Reset to default",
+                use_container_width=True,
+                help="Overwrite saved profile with code defaults and switch to Default mode.",
+            ):
+                with SessionLocal() as session:
+                    reset_profile_to_default_in_db(session=session)
+                    session.commit()
+                st.cache_data.clear()
+                st.success("Reset to default profile.")
+                st.rerun()
+
+        # Show the profile that will be used, based on selected mode.
+        if selected_mode == "default":
+            with SessionLocal() as session:
+                # get_effective_profile(session) will return defaults when mode=default,
+                # but we want the exact default values immediately even before rerun.
+                current_profile = get_effective_profile(session=session)
+        else:
+            # Custom mode already loaded into current_profile above.
+            pass
+
         roles = st.text_area(
             "Target roles (comma-separated)",
             value=", ".join(current_profile.get("target_roles", [])),

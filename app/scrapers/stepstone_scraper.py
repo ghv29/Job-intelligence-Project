@@ -30,10 +30,27 @@ BASE_URL = "https://www.stepstone.de"
 def _slugify_segment(text: str) -> str:
     """
     Build a URL-friendly slug similar to StepStone paths (e.g. data-analyst-in-stuttgart).
-    Non-ASCII letters are dropped after normalization so 'München' -> 'munchen'.
+
+    Strips combining marks (accents) but maps letters that NFKD leaves non-ASCII
+    (e.g. Turkish dotless i, Polish ł) so words are not corrupted. Pure
+    ``encode('ascii', 'ignore')`` can drop those letters and turn
+    "Softwareentwickler" into "softwareentwicker".
     """
     normalized = unicodedata.normalize("NFKD", text)
-    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    no_marks = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    folded = (
+        no_marks.replace("ß", "ss")
+        .replace("æ", "ae")
+        .replace("Æ", "ae")
+        .replace("ø", "o")
+        .replace("Ø", "o")
+        .replace("ł", "l")
+        .replace("Ł", "l")
+        .replace("đ", "d")
+        .replace("ı", "i")
+        .replace("İ", "i")
+    )
+    ascii_text = folded.encode("ascii", "ignore").decode("ascii")
     ascii_text = ascii_text.lower().strip()
     ascii_text = re.sub(r"[^a-z0-9]+", "-", ascii_text)
     return ascii_text.strip("-")
@@ -228,10 +245,30 @@ def fetch_stepstone_jobs(
     url = _search_url(query, location)
     pages_read = 0
 
+    def _get_page(page_url: str, *, attempts: int = 3) -> requests.Response:
+        delay = 1.5
+        last_exc: requests.RequestException | None = None
+        for attempt in range(attempts):
+            try:
+                response = sess.get(page_url, timeout=40)
+                if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                response.raise_for_status()
+                return response
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt + 1 < attempts:
+                    time.sleep(delay)
+                    delay *= 2
+        if last_exc:
+            raise last_exc
+        raise requests.RequestException("no response")
+
     try:
         while url and pages_read < max_pages:
-            response = sess.get(url, timeout=40)
-            response.raise_for_status()
+            response = _get_page(url)
             soup = BeautifulSoup(response.text, "html.parser")
 
             for card in soup.select('[data-at="job-item"]'):

@@ -12,6 +12,7 @@ This small bootstrap makes both of these work:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import date
 from pathlib import Path
@@ -31,8 +32,31 @@ from app.scrapers.stepstone_scraper import fetch_stepstone_jobs
 from app.services.pinecone_store import upsert_job as upsert_job_to_pinecone
 from app.services.skill_extractor import extract_skills
 
-MAX_ROLES = 3
-MAX_CITIES = 3
+DEFAULT_MAX_ROLES = 3
+DEFAULT_MAX_CITIES = 3
+DEFAULT_MAX_PAGES = 2
+
+# Short words that appear in role names but are too generic to use as title filters.
+_NOISE_WORDS = {"und", "fur", "für", "der", "die", "das", "mit", "von", "bei", "im", "in", "an", "am", "auf", "als", "zum", "zur", "and", "for", "the"}
+_MIN_KEYWORD_LEN = 4
+
+
+def _extract_title_keywords(roles: list[str]) -> set[str]:
+    """Derive meaningful keywords from target role names for post-scrape filtering."""
+    keywords: set[str] = set()
+    for role in roles:
+        for word in role.lower().split():
+            word = word.strip("()/+&")
+            if len(word) >= _MIN_KEYWORD_LEN and word not in _NOISE_WORDS:
+                keywords.add(word)
+    return keywords
+
+
+def _is_relevant_title(title: str, keywords: set[str]) -> bool:
+    """Return True if the job title contains at least one target role keyword."""
+    lower = title.lower()
+    return any(kw in lower for kw in keywords)
+
 
 FALLBACK_QUERIES: list[tuple[str, str]] = [
     ("Data Analyst", "Berlin"),
@@ -44,7 +68,7 @@ FALLBACK_QUERIES: list[tuple[str, str]] = [
 ]
 
 
-def _build_search_queries() -> list[tuple[str, str]]:
+def _build_search_queries(*, max_roles: int, max_cities: int) -> list[tuple[str, str]]:
     """Build (role, city) pairs from the saved profile, or fall back to defaults."""
     if not SessionLocal:
         return FALLBACK_QUERIES
@@ -55,8 +79,8 @@ def _build_search_queries() -> list[tuple[str, str]]:
     except Exception:
         return FALLBACK_QUERIES
 
-    roles = profile.get("target_roles", [])[:MAX_ROLES]
-    cities = profile.get("priority_cities", [])[:MAX_CITIES]
+    roles = profile.get("target_roles", [])[:max_roles]
+    cities = profile.get("priority_cities", [])[:max_cities]
 
     if not roles or not cities:
         return FALLBACK_QUERIES
@@ -154,7 +178,7 @@ def sync_job_skills(session, job: Job) -> int:
     return len(extracted)
 
 
-def run() -> None:
+def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CITIES, max_pages: int = DEFAULT_MAX_PAGES) -> None:
     # Stop early with a clear message when DB settings are missing.
     if not engine or not SessionLocal:
         raise RuntimeError("DATABASE_URL is missing. Set it in your .env file.")
@@ -162,8 +186,17 @@ def run() -> None:
     # Create tables once if they do not exist yet.
     Base.metadata.create_all(bind=engine)
 
+    # Load profile once — used for both building queries and title filtering.
+    try:
+        with SessionLocal() as session:
+            profile = get_effective_profile(session=session)
+    except Exception:
+        profile = {}
+
+    title_keywords = _extract_title_keywords(profile.get("target_roles", []))
+
     # Build search queries from saved profile (or fallback defaults).
-    search_queries = _build_search_queries()
+    search_queries = _build_search_queries(max_roles=max_roles, max_cities=max_cities)
 
     # Collect jobs from all query combinations.
     jobs = []
@@ -173,7 +206,7 @@ def run() -> None:
             batch = fetch_stepstone_jobs(
                 query=role,
                 location=city,
-                max_pages=2,
+                    max_pages=max_pages,
                 fetch_full_description=True,
             )
             jobs.extend(batch)
@@ -187,6 +220,16 @@ def run() -> None:
     else:
         print("Skipping placeholder Indeed source (set USE_MOCK_INDEED=true to include mock data).")
     print(f"Fetched {len(jobs)} jobs total across {len(search_queries)} queries")
+
+    # Drop jobs whose title doesn't match any target role keyword.
+    # StepStone pads results for small cities with unrelated local jobs (e.g. forklift
+    # drivers when searching "Data Analyst in Helmstedt") — this removes that noise.
+    if title_keywords:
+        before = len(jobs)
+        jobs = [j for j in jobs if _is_relevant_title(j.get("title", ""), title_keywords)]
+        removed = before - len(jobs)
+        if removed:
+            print(f"Title filter: removed {removed} irrelevant jobs, {len(jobs)} remaining")
 
     inserted = 0
     updated = 0
@@ -209,35 +252,44 @@ def run() -> None:
                     continue
                 if not _parse_date(job.get("date_posted")) and job.get("date_posted") is not None:
                     parse_failures += 1
-                is_existing = (
-                    session.query(Job.id).filter(Job.url == _canonical_url(job.get("url"))).first() is not None
-                )
-                job_row = upsert_job(session, job)
-                if is_existing:
-                    updated += 1
-                else:
-                    inserted += 1
-                description_lengths.append(len((job_row.description or "").strip()))
-                extracted_skills += sync_job_skills(session, job_row)
+                canon = _canonical_url(job.get("url"))
+                # SAVEPOINT: one bad row (e.g. lost SSL) must not poison the whole batch.
+                with session.begin_nested():
+                    is_existing = session.query(Job.id).filter(Job.url == canon).first() is not None
+                    job_row = upsert_job(session, job)
+                    if is_existing:
+                        updated += 1
+                    else:
+                        inserted += 1
+                    description_lengths.append(len((job_row.description or "").strip()))
+                    extracted_skills += sync_job_skills(session, job_row)
+                    job_id = int(job_row.id)
+                    title_txt = job_row.title or ""
+                    company_txt = job_row.company or ""
+                    location_txt = job_row.location or ""
+                    description_txt = job_row.description or ""
 
                 # Pinecone vector upsert (best-effort; never abort the run).
                 try:
                     vector_id = upsert_job_to_pinecone(
-                        job_id=int(job_row.id),
-                        title=job_row.title or "",
-                        company=job_row.company or "",
-                        location=job_row.location or "",
-                        description=job_row.description or "",
+                        job_id=job_id,
+                        title=title_txt,
+                        company=company_txt,
+                        location=location_txt,
+                        description=description_txt,
                     )
-                    job_row.pinecone_id = vector_id
+                    session.query(Job).filter(Job.id == job_id).update(
+                        {"pinecone_id": vector_id},
+                        synchronize_session=False,
+                    )
                     pinecone_upserted += 1
                 except Exception as e:
-                    print(f"Pinecone upsert failed for job_id={job_row.id}: {e}")
+                    print(f"Pinecone upsert failed for job_id={job_id}: {e}")
             except Exception as e:
                 print(f"Failed to process job url={job.get('url')} source={_source_name(job)} error={e}")
                 failed += 1
 
-        # Single commit keeps the run atomic and easier to reason about.
+        # One commit for all successful savepoints.
         session.commit()
 
     print(f"Inserted: {inserted}")
@@ -257,4 +309,9 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Scrape jobs and upsert into the database.")
+    parser.add_argument("--max-roles", type=int, default=DEFAULT_MAX_ROLES, help="Use only the first N target roles.")
+    parser.add_argument("--max-cities", type=int, default=DEFAULT_MAX_CITIES, help="Use only the first N priority cities.")
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="How many StepStone result pages per query.")
+    args = parser.parse_args()
+    run(max_roles=max(1, int(args.max_roles)), max_cities=max(1, int(args.max_cities)), max_pages=max(1, int(args.max_pages)))
