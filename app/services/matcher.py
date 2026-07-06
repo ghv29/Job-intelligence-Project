@@ -9,6 +9,11 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Job, Skill
 from app.profile import build_profile
+from app.services.language_gate import (
+    TIER_ENGLISH_FRIENDLY,
+    TIER_REQUIRED_C1,
+    detect_german_requirement,
+)
 from app.services.pinecone_store import search_jobs_semantic
 
 
@@ -312,8 +317,22 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
     semantic_raw = float(job.get("semantic_score") or 0.0)
     semantic_score = max(0.0, min(w_semantic, semantic_raw * w_semantic))
 
+    # 4b) German-language requirement (tiered — see language_gate.py).
+    # Only an explicit C1/C2/verhandlungssicher demand is penalised; the user
+    # has worked in German-only companies at B1, so boilerplate is a note only.
+    language = detect_german_requirement(f"{job_title} {job_desc}")
+    language_penalty = 0.0
+    language_bonus = 0.0
+    if language["tier"] == TIER_REQUIRED_C1:
+        language_penalty = 0.15
+        reasons.append("German C1+/verhandlungssicher explicitly required")
+    elif language["tier"] == TIER_ENGLISH_FRIENDLY:
+        language_bonus = 0.05
+        reasons.append("English-friendly posting")
+
     # Combine into final score
     match_score = role_score + location_score + skill_score + watch_bonus + edge_score + freshness_score + semantic_score
+    match_score = match_score - language_penalty + language_bonus
     match_score = max(0.0, min(1.0, match_score))
 
     # 5) Skill gaps (from skills_to_watch_for)
@@ -329,6 +348,7 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
         "reasons": reasons[:5],
         "skill_gaps": skill_gaps,
         # These fields are helpful for debugging/UI; they’re not required.
+        "language": language,
         "debug": {
             "score_components": {
                 "role": round(role_score, 3),
@@ -338,6 +358,8 @@ def score_job_for_profile(job: dict, profile: dict | None = None) -> dict:
                 "sector_edge": round(edge_score, 3),
                 "freshness": round(freshness_score, 3),
                 "semantic": round(semantic_score, 3),
+                "language_penalty": round(-language_penalty, 3),
+                "language_bonus": round(language_bonus, 3),
             },
             "role_hits": role_hits,
             "overlap_skills": sorted(overlap),
