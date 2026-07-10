@@ -78,6 +78,13 @@ class Settings:
     pinecone_api_key: str = _clean_env(os.getenv("PINECONE_API_KEY", ""))
     pinecone_index: str = _clean_env(os.getenv("PINECONE_INDEX", ""))
 
+    # Embeddings: local, free model run via fastembed (no API key/quota).
+    # Must match the Pinecone index dimension (see scripts/recreate_pinecone_index.py).
+    embedding_model: str = _clean_env(
+        os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    )
+    embedding_dim: int = int(_clean_env(os.getenv("EMBEDDING_DIM", "384")) or "384")
+
     # Integration tokens
     telegram_bot_token: str = _clean_env(os.getenv("TELEGRAM_BOT_TOKEN", ""))
     notion_api_key: str = _clean_env(os.getenv("NOTION_API_KEY", ""))

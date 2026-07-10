@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from uuid import uuid4
 
-from openai import OpenAI
 from pinecone import Pinecone
 
 from app.config import settings
@@ -21,11 +22,28 @@ def _get_streamlit_secret(key: str) -> str:
         return ""
 
 
-def _get_openai_client() -> OpenAI:
-    api_key = _get_streamlit_secret("OPENAI_API_KEY") or settings.openai_api_key
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing. Set it in your .env file.")
-    return OpenAI(api_key=api_key)
+@lru_cache(maxsize=1)
+def _get_embedding_model():
+    """
+    Load the local embedding model once per process (cached).
+
+    Uses fastembed (ONNX, CPU) so embeddings are free and offline — no OpenAI
+    key or quota. The model downloads once (~220 MB) into a stable cache dir,
+    then loads from disk on every later run.
+    """
+    import os
+
+    # Quiet the HuggingFace "Fetching N files" progress bar and symlink warning.
+    # After the one-time download these files are served from the local cache,
+    # so the bar was misleading (it prints even on a pure cache hit).
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+    from fastembed import TextEmbedding
+
+    cache_dir = Path.home() / ".cache" / "fastembed"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return TextEmbedding(settings.embedding_model, cache_dir=str(cache_dir))
 
 
 def _get_index():
@@ -41,17 +59,19 @@ def _get_index():
 
 def embed_text(text: str) -> list[float]:
     """
-    Embed a text string using OpenAI's `text-embedding-3-small` model.
+    Embed a text string using a local fastembed model (free, offline).
 
-    Returns the embedding vector as a list of floats.
+    Returns the embedding vector as a list of floats (empty list for empty text).
+    The vector size must match the Pinecone index dimension (settings.embedding_dim).
     """
     text = (text or "").strip()
     if not text:
         return []
 
-    client = _get_openai_client()
-    resp = client.embeddings.create(model="text-embedding-3-small", input=text)
-    return list(resp.data[0].embedding)
+    model = _get_embedding_model()
+    # model.embed yields one vector per input text; take the first.
+    vector = next(iter(model.embed([text])))
+    return [float(x) for x in vector]
 
 
 def upsert_job(job_id: int, title: str, company: str, location: str, description: str) -> str:

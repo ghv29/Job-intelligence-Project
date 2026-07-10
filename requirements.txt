@@ -13,4 +13,5 @@ pinecone-client>=3,<4
 python-telegram-bot>=21,<22
 notion-client>=2,<3
 openai>=1,<2
+fastembed>=0.7,<1
 pytest
