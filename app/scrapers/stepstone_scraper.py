@@ -56,8 +56,12 @@ def _slugify_segment(text: str) -> str:
     return ascii_text.strip("-")
 
 
-def _search_url(query: str, location: str) -> str:
-    q, loc = _slugify_segment(query), _slugify_segment(location)
+def _search_url(query: str, location: str | None) -> str:
+    q = _slugify_segment(query)
+    loc = _slugify_segment(location) if location else ""
+    # Empty location => nationwide search (StepStone: /work/{query}).
+    if not loc:
+        return f"{BASE_URL}/work/{q}"
     return f"{BASE_URL}/work/{q}-in-{loc}"
 
 
@@ -212,7 +216,7 @@ def _fetch_full_description(
 
 def fetch_stepstone_jobs(
     query: str,
-    location: str,
+    location: str | None = None,
     *,
     max_pages: int = 1,
     page_delay_sec: float = 1.0,

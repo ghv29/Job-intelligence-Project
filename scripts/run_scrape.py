@@ -27,14 +27,18 @@ from app.db.models import Job, Skill
 from app.db.session import Base, SessionLocal, engine
 from app.config import settings
 from app.profile import get_effective_profile
+from app.scrapers.arbeitsagentur_scraper import fetch_arbeitsagentur_jobs
 from app.scrapers.indeed_scraper import fetch_indeed_jobs
 from app.scrapers.stepstone_scraper import fetch_stepstone_jobs
 from app.services.pinecone_store import upsert_job as upsert_job_to_pinecone
 from app.services.skill_extractor import extract_skills
 
-DEFAULT_MAX_ROLES = 3
+DEFAULT_MAX_ROLES = 12
 DEFAULT_MAX_CITIES = 3
-DEFAULT_MAX_PAGES = 2
+DEFAULT_MAX_PAGES = 3
+# Search all of Germany by default and let the matcher's location score
+# reward jobs in the profile's priority/secondary cities (see matcher.py).
+DEFAULT_NATIONWIDE = True
 
 # Short words that appear in role names but are too generic to use as title filters.
 _NOISE_WORDS = {"und", "fur", "für", "der", "die", "das", "mit", "von", "bei", "im", "in", "an", "am", "auf", "als", "zum", "zur", "and", "for", "the"}
@@ -58,6 +62,12 @@ def _is_relevant_title(title: str, keywords: set[str]) -> bool:
     return any(kw in lower for kw in keywords)
 
 
+FALLBACK_ROLES: list[str] = [
+    "Data Analyst",
+    "Business Intelligence Analyst",
+    "Operations Analyst",
+]
+
 FALLBACK_QUERIES: list[tuple[str, str]] = [
     ("Data Analyst", "Berlin"),
     ("Data Analyst", "Hamburg"),
@@ -68,11 +78,37 @@ FALLBACK_QUERIES: list[tuple[str, str]] = [
 ]
 
 
-def _build_search_queries(*, max_roles: int, max_cities: int) -> list[tuple[str, str]]:
-    """Build (role, city) pairs from the saved profile, or fall back to defaults."""
+def _profile_roles(max_roles: int) -> list[str]:
+    """Load target roles from the saved profile, or fall back to defaults."""
+    if not SessionLocal:
+        return FALLBACK_ROLES[:max_roles]
+    try:
+        with SessionLocal() as session:
+            profile = get_effective_profile(session=session)
+    except Exception:
+        return FALLBACK_ROLES[:max_roles]
+    roles = profile.get("target_roles", [])[:max_roles]
+    return roles or FALLBACK_ROLES[:max_roles]
+
+
+def _build_search_queries(
+    *, max_roles: int, max_cities: int, nationwide: bool
+) -> list[tuple[str, str]]:
+    """
+    Build (role, location) pairs to scrape.
+
+    Nationwide mode uses an empty location so the scrapers search all of Germany;
+    the matcher then scores each job by whether its city is in the profile's
+    priority/secondary lists. City mode (legacy) multiplies roles x cities.
+    """
+    if nationwide:
+        roles = _profile_roles(max_roles)
+        queries = [(role, "") for role in roles]
+        print(f"Nationwide scrape: {len(queries)} role queries across all of Germany")
+        return queries
+
     if not SessionLocal:
         return FALLBACK_QUERIES
-
     try:
         with SessionLocal() as session:
             profile = get_effective_profile(session=session)
@@ -86,7 +122,7 @@ def _build_search_queries(*, max_roles: int, max_cities: int) -> list[tuple[str,
         return FALLBACK_QUERIES
 
     queries = [(role, city) for role in roles for city in cities]
-    print(f"Profile-driven scrape: {len(queries)} queries from {len(roles)} roles x {len(cities)} cities")
+    print(f"City scrape: {len(queries)} queries from {len(roles)} roles x {len(cities)} cities")
     return queries
 
 
@@ -178,7 +214,13 @@ def sync_job_skills(session, job: Job) -> int:
     return len(extracted)
 
 
-def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CITIES, max_pages: int = DEFAULT_MAX_PAGES) -> None:
+def run(
+    *,
+    max_roles: int = DEFAULT_MAX_ROLES,
+    max_cities: int = DEFAULT_MAX_CITIES,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    nationwide: bool = DEFAULT_NATIONWIDE,
+) -> None:
     # Stop early with a clear message when DB settings are missing.
     if not engine or not SessionLocal:
         raise RuntimeError("DATABASE_URL is missing. Set it in your .env file.")
@@ -196,23 +238,38 @@ def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CIT
     title_keywords = _extract_title_keywords(profile.get("target_roles", []))
 
     # Build search queries from saved profile (or fallback defaults).
-    search_queries = _build_search_queries(max_roles=max_roles, max_cities=max_cities)
+    search_queries = _build_search_queries(
+        max_roles=max_roles, max_cities=max_cities, nationwide=nationwide
+    )
 
-    # Collect jobs from all query combinations.
+    # Collect jobs from all query combinations, across every source.
     jobs = []
     for role, city in search_queries:
-        print(f"  Scraping: \"{role}\" in \"{city}\" ...")
+        where = city if city else "all of Germany"
+        print(f"  Scraping: \"{role}\" in \"{where}\" ...")
         try:
             batch = fetch_stepstone_jobs(
                 query=role,
                 location=city,
-                    max_pages=max_pages,
+                max_pages=max_pages,
                 fetch_full_description=True,
             )
             jobs.extend(batch)
-            print(f"    -> {len(batch)} jobs")
+            print(f"    -> stepstone: {len(batch)} jobs")
         except Exception as e:
-            print(f"    -> FAILED: {e}")
+            print(f"    -> stepstone FAILED: {e}")
+
+        try:
+            batch = fetch_arbeitsagentur_jobs(
+                query=role,
+                location=city,
+                max_pages=max_pages,
+                fetch_full_description=True,
+            )
+            jobs.extend(batch)
+            print(f"    -> arbeitsagentur: {len(batch)} jobs")
+        except Exception as e:
+            print(f"    -> arbeitsagentur FAILED: {e}")
 
     if settings.use_mock_indeed:
         for role, city in search_queries[:3]:
@@ -242,11 +299,12 @@ def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CIT
     description_lengths: list[int] = []
 
     # Embeddings are optional: the keyword/skill scoring and the career-ops
-    # export work without them. Skip cleanly when keys are missing, and stop
-    # retrying after a quota/auth error instead of burning a call per job.
-    embeddings_enabled = bool(settings.openai_api_key and settings.pinecone_api_key and settings.pinecone_index)
+    # export work without them. Vectors are generated by a local (free) model,
+    # so only a Pinecone destination is required. Stop retrying after a
+    # persistent error instead of burning a call per job.
+    embeddings_enabled = bool(settings.pinecone_api_key and settings.pinecone_index)
     if not embeddings_enabled:
-        print("Embeddings disabled (OPENAI_API_KEY / PINECONE_API_KEY not set) — skipping Pinecone sync.")
+        print("Embeddings disabled (PINECONE_API_KEY / PINECONE_INDEX not set) — skipping Pinecone sync.")
 
     _FATAL_EMBEDDING_MARKERS = ("insufficient_quota", "invalid_api_key", "authentication", "401")
 
@@ -326,7 +384,25 @@ def run(*, max_roles: int = DEFAULT_MAX_ROLES, max_cities: int = DEFAULT_MAX_CIT
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape jobs and upsert into the database.")
     parser.add_argument("--max-roles", type=int, default=DEFAULT_MAX_ROLES, help="Use only the first N target roles.")
-    parser.add_argument("--max-cities", type=int, default=DEFAULT_MAX_CITIES, help="Use only the first N priority cities.")
-    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="How many StepStone result pages per query.")
+    parser.add_argument("--max-cities", type=int, default=DEFAULT_MAX_CITIES, help="City mode only: use the first N priority cities.")
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="How many result pages per query, per source.")
+    parser.add_argument(
+        "--nationwide",
+        dest="nationwide",
+        action="store_true",
+        default=DEFAULT_NATIONWIDE,
+        help="Search all of Germany (default); location is scored, not filtered.",
+    )
+    parser.add_argument(
+        "--no-nationwide",
+        dest="nationwide",
+        action="store_false",
+        help="Legacy city mode: scrape each priority city separately.",
+    )
     args = parser.parse_args()
-    run(max_roles=max(1, int(args.max_roles)), max_cities=max(1, int(args.max_cities)), max_pages=max(1, int(args.max_pages)))
+    run(
+        max_roles=max(1, int(args.max_roles)),
+        max_cities=max(1, int(args.max_cities)),
+        max_pages=max(1, int(args.max_pages)),
+        nationwide=bool(args.nationwide),
+    )
